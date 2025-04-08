@@ -1,66 +1,102 @@
-from fastapi import APIRouter, Depends, HTTPException
-from api.schemas.content_schemas import (
-    ImageToTextRequest,
-    ImageToTextResponse,
-    FlashcardRequest,
-    FlashcardResponse,
-)
-from api.utils.gemini_utils import extract_text_from_image, generate_flashcards 
-from api.middlewares.auth_middleware import get_current_user
-from typing import Dict, Any
-import logging
+from typing import List, Dict, Any
+import uuid
+import re
+from api.schemas.content_schemas import ContentChunk
+from api.utils.gemini_utils import EMBEDDING_MODEL_NAME, EMBEDDING_DIMENSION
 
-logger = logging.getLogger(__name__)
-
-# Renommer le préfixe et les tags
-router = APIRouter(prefix="/ai", tags=["AI Services (Gemini)"]) 
-
-@router.post("/extract-text", response_model=ImageToTextResponse)
-async def extract_text(
-    request: ImageToTextRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-) -> ImageToTextResponse:
-    """Extract text from an image using Gemini Vision"""
-    if not request.image_base64:
-        logger.warning(f"User {current_user.get('id')} requested text extraction without image data.")
-        raise HTTPException(status_code=400, detail="Image data (base64 encoded) is required")
+async def chunk_text(text: str, chunk_size: int = 3000, overlap: int = 200, 
+                     metadata: Dict[str, Any] = None) -> List[ContentChunk]:
+    """
+    Découpe un texte long en chunks avec chevauchement pour améliorer la recherche RAG.
     
-    logger.info(f"User {current_user.get('id')} requesting text extraction from image.")
-    # Appeler la fonction de gemini_utils
-    result = await extract_text_from_image(request.image_base64) 
+    Args:
+        text: Texte à découper
+        chunk_size: Taille approximative de chaque chunk en caractères
+        overlap: Chevauchement entre les chunks en caractères
+        metadata: Métadonnées communes à tous les chunks (ex: user_id, source_id)
     
-    if not result["success"]:
-         logger.error(f"Text extraction failed for user {current_user.get('id')}: {result.get('error_message')}")
-         # Retourner une réponse d'erreur claire mais sans exposer trop de détails internes
-         raise HTTPException(status_code=500, detail=result.get("error_message", "Text extraction failed"))
+    Returns:
+        Liste de ContentChunk prêts à être insérés dans Pinecone
+    """
+    if not text:
+        return []
+    
+    # Métadonnées par défaut ou fournies
+    base_metadata = metadata or {}
+    
+    # Diviser le texte en paragraphes ou sections logiques si possible
+    # Utiliser une regex plus robuste pour séparer les blocs de texte
+    paragraphs = re.split(r'(\n\s*\n+)', text) # Garde les séparateurs pour reconstruire si besoin
+    
+    # Filtrer les éléments vides et recombiner les paragraphes avec leurs séparateurs
+    processed_paragraphs = []
+    temp_para = ""
+    for item in paragraphs:
+        if item.strip(): # Si ce n'est pas juste un espace blanc/nouvelle ligne
+            temp_para += item
+        elif temp_para: # Si on rencontre un séparateur et qu'on a du texte accumulé
+             processed_paragraphs.append(temp_para.strip())
+             temp_para = ""
+    if temp_para: # Ajouter le dernier paragraphe s'il existe
+        processed_paragraphs.append(temp_para.strip())
 
-    logger.info(f"Text extraction successful for user {current_user.get('id')}.")
-    return ImageToTextResponse(**result)
+    if not processed_paragraphs: # Si le découpage initial ne donne rien, utiliser le texte entier
+        processed_paragraphs = [text.strip()]
 
-@router.post("/generate-flashcards", response_model=FlashcardResponse)
-async def create_flashcards(
-    request: FlashcardRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-) -> FlashcardResponse:
-    """Generate flashcards from text using Gemini"""
-    if not request.text or not request.text.strip():
-        logger.warning(f"User {current_user.get('id')} requested flashcard generation with empty text.")
-        raise HTTPException(status_code=400, detail="Text content is required")
+    chunks = []
+    current_chunk_text = ""
+    chunk_index = 0
+    total_paragraphs = len(processed_paragraphs) # Nombre total de paragraphes/blocs
     
-    if request.num_cards <= 0:
-        logger.warning(f"User {current_user.get('id')} requested non-positive number of flashcards: {request.num_cards}")
-        raise HTTPException(status_code=400, detail="Number of cards must be greater than 0")
-    
-    logger.info(f"User {current_user.get('id')} requesting {request.num_cards} flashcards.")
-    # Appeler la fonction de gemini_utils
-    flashcards_data = await generate_flashcards(request.text, request.num_cards) 
-    
-    if not flashcards_data:
-        logger.warning(f"Flashcard generation returned no results for user {current_user.get('id')}.")
-        # Peut-être que le texte était trop court ou inapproprié
-        raise HTTPException(status_code=404, detail="Could not generate flashcards from the provided text. The text might be too short or lack sufficient information.")
+    for i, para in enumerate(processed_paragraphs):
+        para_len = len(para)
+        current_chunk_len = len(current_chunk_text)
 
-    # Pas besoin de convertir ici si gemini_utils retourne déjà le bon format
-    # flashcards = [Flashcard(**card) for card in flashcards_data] 
-    logger.info(f"Flashcard generation successful for user {current_user.get('id')}, generated {len(flashcards_data)} cards.")
-    return FlashcardResponse(flashcards=flashcards_data)
+        # Si l'ajout du paragraphe dépasse la taille max du chunk
+        # (ajouter 2 pour l'espace potentiel ou \n\n)
+        if current_chunk_len > 0 and current_chunk_len + para_len + 2 > chunk_size:
+            # Finaliser le chunk actuel
+            chunk_id = f"chunk-{str(uuid.uuid4())}"
+            chunk_metadata = {
+                **base_metadata,
+                "chunk_index": chunk_index,
+                "position": f"{chunk_index + 1}/{total_paragraphs}", # Position basée sur les paragraphes
+                "embedding_model": EMBEDDING_MODEL_NAME, # Utiliser la constante
+                "dimension": EMBEDDING_DIMENSION, # Utiliser la constante
+                # Ajouter d'autres métadonnées si pertinent
+            }
+            chunks.append(ContentChunk(
+                id=chunk_id,
+                text=current_chunk_text.strip(),
+                metadata=chunk_metadata
+            ))
+            chunk_index += 1
+            
+            # Commencer un nouveau chunk avec chevauchement
+            overlap_text = current_chunk_text[-overlap:].lstrip() if overlap > 0 else ""
+            current_chunk_text = overlap_text + "\n\n" + para if overlap_text else para # Ajouter le paragraphe actuel au nouveau chunk
+        
+        # Sinon, ajouter le paragraphe au chunk actuel
+        else:
+            if current_chunk_text:
+                current_chunk_text += "\n\n" + para
+            else:
+                current_chunk_text = para
+
+    # Ajouter le dernier chunk s'il contient du texte
+    if current_chunk_text.strip():
+        chunk_id = f"chunk-{str(uuid.uuid4())}"
+        chunk_metadata = {
+            **base_metadata,
+            "chunk_index": chunk_index,
+            "position": f"{chunk_index + 1}/{total_paragraphs}",
+            "embedding_model": EMBEDDING_MODEL_NAME, # Utiliser la constante
+            "dimension": EMBEDDING_DIMENSION, # Utiliser la constante
+        }
+        chunks.append(ContentChunk(
+            id=chunk_id,
+            text=current_chunk_text.strip(),
+            metadata=chunk_metadata
+        ))
+
+    return chunks
