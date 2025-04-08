@@ -1,0 +1,6 @@
+fastapi[standard]
+pydantic-settings
+chromadb
+supabase
+google-generativeai
+python-dotenv
