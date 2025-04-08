@@ -5,15 +5,16 @@ FROM python:3.13-alpine
 WORKDIR /app
 
 # Installer les dépendances système nécessaires pour compiler 
-# certaines bibliothèques Python (équivalent de build-essential sur Alpine)
+# certaines bibliothèques Python (C/C++ et Rust)
 # Utiliser --no-cache pour réduire la taille de l'image en ne gardant pas le cache apk
 RUN apk add --no-cache \
     build-base \
     python3-dev \
     gcc \
     libc-dev \
-    linux-headers
-    # Ajoutez d'autres dépendances apk si nécessaire pour votre projet (ex: postgresql-dev, libffi-dev)
+    linux-headers \
+    rust \
+    cargo 
 
 # Mettre à jour pip
 RUN pip install --upgrade pip
@@ -23,7 +24,7 @@ COPY requirements.txt requirements.txt
 
 # Installer les dépendances Python
 # --no-cache-dir peut réduire la taille de l'image pip
-# Certaines bibliothèques peuvent nécessiter les outils de build installés ci-dessus
+# ChromaDB nécessite maintenant Rust/Cargo qui ont été installés ci-dessus
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copier le reste du code de l'application dans le répertoire de travail
@@ -34,4 +35,4 @@ EXPOSE 8000
 
 # Commande pour lancer l'application lorsque le conteneur démarre
 # Utilise l'hôte 0.0.0.0 pour être accessible depuis l'extérieur du conteneur
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
